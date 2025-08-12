@@ -1,0 +1,1 @@
+python BrainTumorSegmentation\compare.py --input_path "C:\Users\Kevin\Documents\ImperialSummerSchool\BrainTumorSegmentation\dataset_segmentation\train\001\001_fla.nii.gz" --ground_truth_path "C:\Users\Kevin\Documents\ImperialSummerSchool\BrainTumorSegmentation\dataset_segmentation\train\001\001_seg.nii.gz"

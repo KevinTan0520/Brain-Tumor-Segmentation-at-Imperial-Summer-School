@@ -1,0 +1,1 @@
+python BrainTumorSegmentation\test.py --input_path "C:\Users\Kevin\Documents\ImperialSummerSchool\BrainTumorSegmentation\dataset_segmentation\train\002\002_fla.nii.gz"
