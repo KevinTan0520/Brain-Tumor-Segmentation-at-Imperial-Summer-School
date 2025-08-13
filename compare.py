@@ -76,22 +76,146 @@ class UNet(nn.Module):
         return torch.sigmoid(self.final_conv(x))
 
 def load_model(model_path, device):
-    """加载训练好的模型"""
-    # 如果model_path不是绝对路径，则基于当前目录构建路径
+    """加载训练好的模型 - 兼容新旧格式和PyTorch版本"""
+    # 确保torch模块可用
+    import torch as torch_module
+    
     if not os.path.isabs(model_path):
         model_path = os.path.join(CURRENT_DIR, model_path)
     
     print(f"Loading model from: {model_path}")
+    print(f"PyTorch version: {torch_module.__version__}")
     
     model = UNet().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    try:
+        # 方法1: 首先尝试安全加载（仅权重）- 适用于PyTorch 2.6+
+        print("Attempting safe loading (weights_only=True)...")
+        checkpoint = torch_module.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint)
+        print("✓ Model loaded successfully with weights_only=True")
+        
+    except Exception as e1:
+        print(f"Safe loading failed: {e1}")
+        
+        try:
+            # 方法2: 尝试加载完整检查点（兼容旧格式）
+            print("Attempting full checkpoint loading...")
+            checkpoint = torch_module.load(model_path, map_location=device, weights_only=False)
+            
+            if isinstance(checkpoint, dict):
+                if 'model_state_dict' in checkpoint:
+                    # 新格式：包含完整训练信息的检查点
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    print("✓ Model loaded from checkpoint dict")
+                    
+                    # 打印训练信息
+                    if 'best_dice' in checkpoint:
+                        print(f"  → Model's best validation Dice: {checkpoint['best_dice']:.4f}")
+                    if 'epoch' in checkpoint:
+                        print(f"  → Model was trained for {checkpoint['epoch']} epochs")
+                    if 'early_stopping_info' in checkpoint:
+                        es_info = checkpoint['early_stopping_info']
+                        if es_info.get('triggered', False):
+                            print(f"  → Training stopped early at epoch {es_info.get('best_epoch', 'N/A')}")
+                        else:
+                            print("  → Training completed without early stopping")
+                
+                else:
+                    # 直接是state_dict格式
+                    model.load_state_dict(checkpoint)
+                    print("✓ Model loaded as direct state_dict")
+            else:
+                # 旧格式：直接加载
+                model.load_state_dict(checkpoint)
+                print("✓ Model loaded directly")
+                
+        except Exception as e2:
+            print(f"Standard loading failed: {e2}")
+            
+            try:
+                # 方法3: 使用安全全局对象上下文
+                print("Attempting loading with safe globals...")
+                # 明确导入torch.serialization
+                import torch.serialization as torch_serialization
+                
+                with torch_serialization.safe_globals([
+                    'numpy.core.multiarray.scalar',
+                    'numpy.dtype', 
+                    'numpy.ndarray',
+                    'collections.OrderedDict',
+                    'builtins.dict',
+                    'builtins.int',
+                    'builtins.float',
+                    'builtins.bool'
+                ]):
+                    checkpoint = torch_module.load(model_path, map_location=device, weights_only=True)
+                    
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                        print("✓ Model loaded with safe globals from checkpoint")
+                    else:
+                        model.load_state_dict(checkpoint)
+                        print("✓ Model loaded with safe globals directly")
+                        
+            except Exception as e3:
+                # 方法4: 最后的尝试 - 完全不安全加载（仅限可信源）
+                print(f"Safe globals loading failed: {e3}")
+                print("⚠️  Attempting unsafe loading (use only for trusted models)...")
+                
+                try:
+                    # 完全禁用安全检查（危险，仅限可信模型）
+                    checkpoint = torch_module.load(model_path, map_location=device, weights_only=False)
+                    
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                        print("✓ Model loaded via unsafe method from checkpoint")
+                    else:
+                        model.load_state_dict(checkpoint)
+                        print("✓ Model loaded via unsafe method directly")
+                        
+                except Exception as e4:
+                    print(f"All loading methods failed!")
+                    print(f"Final error: {e4}")
+                    print(f"Original errors: {e1}, {e2}, {e3}")
+                    
+                    # 提供调试信息
+                    print("\n🔍 Debugging information:")
+                    try:
+                        checkpoint = torch_module.load(model_path, map_location='cpu', weights_only=False)
+                        print(f"  Checkpoint type: {type(checkpoint)}")
+                        if isinstance(checkpoint, dict):
+                            print(f"  Checkpoint keys: {list(checkpoint.keys())}")
+                            
+                            # 更详细的调试信息
+                            for key, value in checkpoint.items():
+                                if hasattr(value, 'shape'):
+                                    print(f"    {key}: tensor with shape {value.shape}")
+                                elif isinstance(value, dict):
+                                    print(f"    {key}: dict with keys {list(value.keys())}")
+                                else:
+                                    print(f"    {key}: {type(value)} - {str(value)[:100]}...")
+                                    
+                    except Exception as debug_e:
+                        print(f"  Cannot inspect checkpoint: {debug_e}")
+                    
+                    raise RuntimeError(f"Unable to load model from {model_path}. Please check the file format and PyTorch version compatibility.")
+    
     model.eval()
+    print(f"✓ Model set to evaluation mode")
     return model
 
 def preprocess_image(image_slice):
     """预处理图像切片"""
-    # 归一化
-    image_slice = (image_slice - image_slice.mean()) / (image_slice.std() + 1e-8)
+    # 改进的归一化：与训练时保持一致
+    if image_slice.std() > 1e-8:
+        image_slice = (image_slice - image_slice.mean()) / image_slice.std()
+    else:
+        image_slice = image_slice - image_slice.mean()
+    
+    # 确保数值范围合理（与训练时保持一致）
+    image_slice = np.clip(image_slice, -5, 5)
+    
     # 转换为tensor并添加batch和channel维度
     image_tensor = torch.FloatTensor(image_slice).unsqueeze(0).unsqueeze(0)
     return image_tensor
@@ -231,8 +355,12 @@ def test_on_nifti_file_with_ground_truth(model, fla_path, seg_path, device, outp
     ground_truths = []
     all_metrics = []
     
+    print("Processing slices...")
     with torch.no_grad():
         for slice_idx in range(num_slices):
+            if (slice_idx + 1) % 20 == 0:
+                print(f"  Processed {slice_idx + 1}/{num_slices} slices")
+            
             # 获取切片
             image_slice = fla_data[:, :, slice_idx]
             true_mask = seg_data[:, :, slice_idx]
@@ -244,7 +372,7 @@ def test_on_nifti_file_with_ground_truth(model, fla_path, seg_path, device, outp
                 ground_truths.append(true_mask)
                 continue
             
-            # 预处理
+            # 预处理（使用改进的预处理方法）
             image_tensor = preprocess_image(image_slice).to(device)
             
             # 预测
@@ -315,8 +443,8 @@ def test_on_nifti_file_with_ground_truth(model, fla_path, seg_path, device, outp
     overall_metrics = calculate_metrics(all_predictions, all_ground_truths)
     
     # 计算切片级别的平均指标
+    avg_metrics = {}
     if all_metrics:
-        avg_metrics = {}
         for key in all_metrics[0].keys():
             if key != 'slice_idx':
                 avg_metrics[f'avg_{key}'] = np.mean([m[key] for m in all_metrics])
@@ -368,7 +496,7 @@ def test_on_nifti_file_with_ground_truth(model, fla_path, seg_path, device, outp
                 f.write(f"{key}: {value:.6f}\n")
         
         f.write(f"\nDETAILED SLICE METRICS:\n")
-        for i, metrics in enumerate(all_metrics):
+        for metrics in all_metrics:
             f.write(f"Slice {metrics['slice_idx']}: Dice={metrics['dice']:.4f}, IoU={metrics['iou']:.4f}\n")
     
     print(f"\nDetailed results saved to: {results_file}")
@@ -404,8 +532,12 @@ def test_on_nifti_file(model, fla_path, device, output_dir='compare_results'):
     num_slices = fla_data.shape[2]
     predictions = []
     
+    print("Processing slices...")
     with torch.no_grad():
         for slice_idx in range(num_slices):
+            if (slice_idx + 1) % 20 == 0:
+                print(f"  Processed {slice_idx + 1}/{num_slices} slices")
+            
             # 获取切片
             image_slice = fla_data[:, :, slice_idx]
             
@@ -414,7 +546,7 @@ def test_on_nifti_file(model, fla_path, device, output_dir='compare_results'):
                 predictions.append(np.zeros_like(image_slice))
                 continue
             
-            # 预处理
+            # 预处理（使用改进的预处理方法）
             image_tensor = preprocess_image(image_slice).to(device)
             
             # 预测
@@ -490,7 +622,7 @@ def test_on_single_image(model, image_path, device, output_dir='compare_results'
         except Exception as e:
             raise ValueError(f"Cannot load image: {image_path}. Error: {e}")
     
-    # 预处理
+    # 预处理（使用改进的预处理方法）
     image_tensor = preprocess_image(image_data).to(device)
     
     # 预测
@@ -564,9 +696,11 @@ def main():
     # 加载模型
     try:
         model = load_model(args.model_path, device)
-        print("Model loaded successfully!")
+        print("✅ Model loaded successfully!")
     except Exception as e:
-        print(f"Error loading model: {e}")
+        print(f"❌ Error loading model: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     # 测试
@@ -577,51 +711,65 @@ def main():
                 # 有ground truth，计算准确度指标
                 predictions, metrics, slice_metrics = test_on_nifti_file_with_ground_truth(
                     model, args.input_path, args.ground_truth_path, device, args.output_dir)
-                print(f"Results and metrics saved to {args.output_dir}")
+                print(f"✅ Results and metrics saved to {args.output_dir}")
             else:
                 # 检查是否可以自动找到对应的seg文件
                 auto_seg_path = args.input_path.replace('_fla.nii.gz', '_seg.nii.gz')
                 if os.path.exists(auto_seg_path):
-                    print(f"Found ground truth file: {auto_seg_path}")
+                    print(f"🔍 Found ground truth file: {auto_seg_path}")
                     predictions, metrics, slice_metrics = test_on_nifti_file_with_ground_truth(
                         model, args.input_path, auto_seg_path, device, args.output_dir)
-                    print(f"Results and metrics saved to {args.output_dir}")
+                    print(f"✅ Results and metrics saved to {args.output_dir}")
                 else:
                     predictions = test_on_nifti_file(model, args.input_path, device, args.output_dir)
-                    print(f"Results saved to {args.output_dir} (no ground truth available)")
+                    print(f"✅ Results saved to {args.output_dir} (no ground truth available)")
         else:
             # 单张图像测试
             mask, overlay = test_on_single_image(model, args.input_path, device, args.output_dir)
-            print(f"Results saved to {args.output_dir}")
+            print(f"✅ Results saved to {args.output_dir}")
             
     except Exception as e:
-        print(f"Error during testing: {e}")
+        print(f"❌ Error during testing: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     # 如果没有命令行参数，提供默认测试示例
     import sys
     if len(sys.argv) == 1:
         # 示例用法
+        print("Brain Tumor Segmentation Model Comparison Tool")
+        print("="*50)
         print("Usage examples:")
-        print("python compare.py --input_path path/to/patient_fla.nii.gz")
-        print("python compare.py --input_path path/to/patient_fla.nii.gz --ground_truth_path path/to/patient_seg.nii.gz")
-        print("python compare.py --input_path path/to/brain_image.png --model_path best_brain_tumor_model.pth")
-        print("python compare.py --input_path path/to/patient_fla.nii.gz --output_dir custom_compare_results")
+        print("  python compare.py --input_path path/to/patient_fla.nii.gz")
+        print("  python compare.py --input_path path/to/patient_fla.nii.gz --ground_truth_path path/to/patient_seg.nii.gz")
+        print("  python compare.py --input_path path/to/brain_image.png --model_path best_brain_tumor_model.pth")
+        print("  python compare.py --input_path path/to/patient_fla.nii.gz --output_dir custom_compare_results")
+        
         print(f"\nCurrent working directory: {CURRENT_DIR}")
         print("All relative paths will be resolved relative to this directory.")
-        print("\nRequired packages:")
-        print("pip install torch torchvision nibabel numpy matplotlib pillow scikit-learn tqdm")
         
-        print("\nOutput:")
-        print("- All results will be saved to 'compare_results' folder by default")
-        print("- Comparison images with color-coded overlays")
-        print("- Detailed metrics text files")
-        print("- Individual slice visualizations")
+        print(f"\nPyTorch version: {torch.__version__}")
+        print("Required packages:")
+        print("  pip install torch torchvision nibabel numpy matplotlib pillow scikit-learn")
         
         print("\nFeatures:")
-        print("- Automatic accuracy evaluation when ground truth is available")
-        print("- Comprehensive metrics: Dice, IoU, Precision, Recall, F1, Specificity")
-        print("- Visual comparison with color-coded overlays")
-        print("- Detailed results saved to text files")
+        print("  ✓ Compatible with PyTorch 2.6+ security changes")
+        print("  ✓ Automatic accuracy evaluation when ground truth is available")
+        print("  ✓ Comprehensive metrics: Dice, IoU, Precision, Recall, F1, Specificity")
+        print("  ✓ Visual comparison with color-coded overlays")
+        print("  ✓ Detailed results saved to text files")
+        print("  ✓ Improved preprocessing matching training pipeline")
+        
+        print("\nOutput:")
+        print("  → All results saved to 'compare_results' folder by default")
+        print("  → Comparison images with color-coded overlays")
+        print("  → Detailed metrics text files")
+        print("  → Individual slice visualizations")
+        
+        print("\nColor coding in comparison images:")
+        print("  🟢 Green: True Positive (correctly predicted tumor)")
+        print("  🔴 Red: False Positive (incorrectly predicted tumor)")
+        print("  🔵 Blue: False Negative (missed tumor)")
     else:
         main()
