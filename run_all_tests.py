@@ -8,6 +8,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import re
+from datetime import datetime
 
 # 获取当前文件所在目录并设置为工作目录
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,54 @@ def find_all_patients(dataset_dir):
     print(f"Total patients found: {len(patient_pairs)}")
     return patient_pairs
 
-def run_single_test(patient_info, model_path, output_base_dir, compare_script_path):
+def generate_timestamp_folder_name(base_name="summary"):
+    """生成带时间戳的文件夹名称"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}"
+
+def check_model_compatibility(model_path):
+    """检查模型文件的格式和兼容性"""
+    try:
+        import torch
+        
+        print(f"Checking model compatibility: {model_path}")
+        print(f"PyTorch version: {torch.__version__}")
+        
+        # 尝试加载模型以检查格式
+        try:
+            # 首先尝试安全加载
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+            print("Model can be loaded with weights_only=True (safe)")
+            return True, "safe_weights_only"
+        except Exception as e1:
+            print(f"Safe loading failed: {e1}")
+            
+            try:
+                # 尝试不安全加载
+                checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+                print("Model can be loaded with weights_only=False")
+                
+                if isinstance(checkpoint, dict):
+                    print(f"Checkpoint contains keys: {list(checkpoint.keys())}")
+                    if 'model_state_dict' in checkpoint:
+                        print("Found model_state_dict (new training format)")
+                        return True, "checkpoint_dict"
+                    else:
+                        print("Direct state_dict format")
+                        return True, "direct_state_dict"
+                else:
+                    print("Legacy model format")
+                    return True, "legacy"
+                    
+            except Exception as e2:
+                print(f"Model loading failed completely: {e2}")
+                return False, f"failed: {e2}"
+                
+    except ImportError:
+        print("PyTorch not available for model checking")
+        return False, "pytorch_not_available"
+
+def run_single_test(patient_info, model_path, output_base_dir, compare_script_path, model_format=None):
     """运行单个patient的测试"""
     patient_id = patient_info['patient_id']
     fla_path = patient_info['fla_path']
@@ -62,6 +110,8 @@ def run_single_test(patient_info, model_path, output_base_dir, compare_script_pa
     print(f"FLA file: {fla_path}")
     print(f"SEG file: {seg_path}")
     print(f"Output dir: {patient_output_dir}")
+    if model_format:
+        print(f"Model format: {model_format}")
     print(f"{'='*60}")
     
     # 构建命令
@@ -80,26 +130,41 @@ def run_single_test(patient_info, model_path, output_base_dir, compare_script_pa
         # 记录开始时间
         start_time = time.time()
         
-        # 运行命令
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5分钟超时
+        # 设置环境变量以便子进程知道模型格式
+        env = os.environ.copy()
+        if model_format:
+            env['MODEL_FORMAT_HINT'] = model_format
+        # 设置编码环境变量以避免Unicode错误
+        env['PYTHONIOENCODING'] = 'utf-8'
+        
+        # 运行命令，增加超时时间以适应新模型的加载时间
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env, encoding='utf-8', errors='ignore')  # 10分钟超时
         
         # 记录结束时间
         end_time = time.time()
         duration = end_time - start_time
         
         if result.returncode == 0:
-            print(f"✅ Patient {patient_id} completed successfully in {duration:.2f} seconds")
+            print(f"Patient {patient_id} completed successfully in {duration:.2f} seconds")
             return True, duration, result.stdout
         else:
-            print(f"❌ Patient {patient_id} failed with return code {result.returncode}")
+            print(f"Patient {patient_id} failed with return code {result.returncode}")
             print(f"Error output: {result.stderr}")
+            
+            # 检查是否是模型加载错误
+            if "Error loading model" in result.stderr or "torch.load" in result.stderr:
+                print("This appears to be a model loading issue. Trying alternative approach...")
+                
+                # 可以在这里添加重试逻辑或者特殊处理
+                return False, duration, f"Model loading error: {result.stderr}"
+            
             return False, duration, result.stderr
             
     except subprocess.TimeoutExpired:
-        print(f"⏰ Patient {patient_id} timed out after 5 minutes")
-        return False, 300, "Timeout"
+        print(f"Patient {patient_id} timed out after 10 minutes")
+        return False, 600, "Timeout (10 minutes)"
     except Exception as e:
-        print(f"💥 Patient {patient_id} failed with exception: {e}")
+        print(f"Patient {patient_id} failed with exception: {e}")
         return False, 0, str(e)
 
 def parse_patient_metrics(patient_output_dir, patient_id):
@@ -112,18 +177,19 @@ def parse_patient_metrics(patient_output_dir, patient_id):
     
     metrics = {}
     try:
-        with open(metrics_file, 'r') as f:
+        with open(metrics_file, 'r', encoding='utf-8') as f:
             content = f.read()
         
         # 解析整体指标
-        overall_section = content.split("OVERALL METRICS:")[1].split("\n\n")[0]
-        for line in overall_section.strip().split('\n'):
-            if ':' in line:
-                key, value = line.split(':', 1)
-                try:
-                    metrics[key.strip()] = float(value.strip())
-                except:
-                    pass
+        if "OVERALL METRICS:" in content:
+            overall_section = content.split("OVERALL METRICS:")[1].split("\n\n")[0]
+            for line in overall_section.strip().split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    try:
+                        metrics[key.strip()] = float(value.strip())
+                    except ValueError:
+                        pass
         
         # 解析统计信息
         if "Total slices:" in content:
@@ -171,7 +237,7 @@ def collect_all_metrics(results, output_base_dir):
     
     return all_metrics
 
-def generate_comprehensive_report(results, all_metrics, output_base_dir):
+def generate_comprehensive_report(results, all_metrics, output_base_dir, model_info=None):
     """生成全面的测试报告"""
     
     # 基本统计
@@ -181,9 +247,9 @@ def generate_comprehensive_report(results, all_metrics, output_base_dir):
     total_time = sum(r['duration'] for r in results)
     
     # 计算指标统计
+    metric_stats = {}
     if all_metrics:
         metric_names = ['dice', 'iou', 'accuracy', 'precision', 'recall', 'f1_score', 'specificity']
-        metric_stats = {}
         
         for metric in metric_names:
             values = [m[metric] for m in all_metrics if metric in m]
@@ -205,7 +271,12 @@ def generate_comprehensive_report(results, all_metrics, output_base_dir):
     with open(report_file, 'w', encoding='utf-8') as f:
         f.write("BRAIN TUMOR SEGMENTATION - COMPREHENSIVE TEST REPORT\n")
         f.write("="*80 + "\n")
-        f.write(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        # 添加模型信息
+        if model_info:
+            f.write(f"Model compatibility: {model_info[1]}\n")
+        f.write("\n")
         
         # 执行概要
         f.write("EXECUTION SUMMARY\n")
@@ -291,26 +362,27 @@ def generate_comprehensive_report(results, all_metrics, output_base_dir):
             total_true_volume = sum(p.get('true_tumor_volume', 0) for p in all_metrics)
             total_pred_volume = sum(p.get('pred_tumor_volume', 0) for p in all_metrics)
             
-            f.write(f"VOLUME ANALYSIS:\n")
-            f.write(f"Total true tumor volume: {total_true_volume:,} voxels\n")
-            f.write(f"Total predicted volume: {total_pred_volume:,} voxels\n")
-            f.write(f"Overall volume ratio: {total_pred_volume/total_true_volume:.4f}\n")
-            
-            if total_pred_volume > total_true_volume * 1.2:
-                f.write("⚠️  Model tends to OVER-segment (predicts too much tumor)\n")
-            elif total_pred_volume < total_true_volume * 0.8:
-                f.write("⚠️  Model tends to UNDER-segment (misses tumor regions)\n")
-            else:
-                f.write("✅ Model shows good volume estimation\n")
-            
-            f.write("\n")
+            if total_true_volume > 0:
+                f.write(f"VOLUME ANALYSIS:\n")
+                f.write(f"Total true tumor volume: {total_true_volume:,} voxels\n")
+                f.write(f"Total predicted volume: {total_pred_volume:,} voxels\n")
+                f.write(f"Overall volume ratio: {total_pred_volume/total_true_volume:.4f}\n")
+                
+                if total_pred_volume > total_true_volume * 1.2:
+                    f.write("WARNING: Model tends to OVER-segment (predicts too much tumor)\n")
+                elif total_pred_volume < total_true_volume * 0.8:
+                    f.write("WARNING: Model tends to UNDER-segment (misses tumor regions)\n")
+                else:
+                    f.write("SUCCESS: Model shows good volume estimation\n")
+                
+                f.write("\n")
         
         # 详细患者结果
         f.write("DETAILED PATIENT RESULTS\n")
         f.write("-"*30 + "\n")
         
         for result in results:
-            status = "✅ SUCCESS" if result['success'] else "❌ FAILED"
+            status = "SUCCESS" if result['success'] else "FAILED"
             f.write(f"Patient {result['patient_id']}: {status} ({result['duration']:.2f}s)\n")
             
             if result['success'] and all_metrics:
@@ -324,7 +396,7 @@ def generate_comprehensive_report(results, all_metrics, output_base_dir):
                 f.write(f"  Error: {result['output'][:100]}...\n")
         
         # 推荐和建议
-        f.write("\nRECOMMENDations\n")
+        f.write("\nRECOMMENDATIONS\n")
         f.write("-"*15 + "\n")
         
         if all_metrics:
@@ -332,65 +404,69 @@ def generate_comprehensive_report(results, all_metrics, output_base_dir):
             dice_std = metric_stats.get('dice', {}).get('std', 0)
             
             if dice_mean < 0.7:
-                f.write("🔧 Model performance is below clinical standards. Consider:\n")
+                f.write("Model performance is below clinical standards. Consider:\n")
                 f.write("   - Collecting more training data\n")
                 f.write("   - Data augmentation techniques\n")
                 f.write("   - Hyperparameter tuning\n")
                 f.write("   - Different loss functions (e.g., Focal Loss)\n")
             
             if dice_std > 0.2:
-                f.write("📊 High variability in performance across patients. Consider:\n")
+                f.write("High variability in performance across patients. Consider:\n")
                 f.write("   - Analyzing patient characteristics\n")
                 f.write("   - Stratified training approach\n")
                 f.write("   - Ensemble methods\n")
             
             if len(poor_performers) > len(all_metrics) * 0.2:
-                f.write("⚠️  More than 20% of patients show poor performance. Consider:\n")
+                f.write("More than 20% of patients show poor performance. Consider:\n")
                 f.write("   - Reviewing data quality\n")
                 f.write("   - Cross-validation analysis\n")
                 f.write("   - Model architecture improvements\n")
         
         if failed > 0:
-            f.write(f"🚨 {failed} tests failed. Check error logs and:\n")
+            f.write(f"{failed} tests failed. Check error logs and:\n")
             f.write("   - Verify data file integrity\n")
             f.write("   - Check system resources\n")
             f.write("   - Review error messages\n")
+            f.write("   - Consider model compatibility issues\n")
 
     # 生成可视化图表
-    generate_visualization_plots(all_metrics, metric_stats, output_base_dir)
+    if all_metrics:
+        generate_visualization_plots(all_metrics, metric_stats, output_base_dir)
     
     # 保存指标到JSON
     metrics_json_file = os.path.join(output_base_dir, "all_metrics.json")
-    with open(metrics_json_file, 'w') as f:
+    with open(metrics_json_file, 'w', encoding='utf-8') as f:
         json.dump({
+            'model_info': model_info[1] if model_info else None,
             'summary_stats': metric_stats if all_metrics else {},
             'patient_metrics': all_metrics,
             'execution_results': results
-        }, f, indent=2)
+        }, f, indent=2, ensure_ascii=False)
     
     print(f"\n{'='*80}")
     print(f"COMPREHENSIVE REPORT GENERATED")
     print(f"{'='*80}")
-    print(f"📄 Detailed report: {report_file}")
-    print(f"📊 Metrics data: {metrics_json_file}")
-    print(f"📈 Visualization plots: {output_base_dir}/visualizations/")
+    print(f"Detailed report: {report_file}")
+    print(f"Metrics data: {metrics_json_file}")
+    if all_metrics:
+        print(f"Visualization plots: {output_base_dir}/visualizations/")
     
     if all_metrics:
         dice_mean = metric_stats.get('dice', {}).get('mean', 0)
-        print(f"\n🎯 KEY RESULTS:")
+        print(f"\nKEY RESULTS:")
         print(f"   Average Dice Score: {dice_mean:.4f}")
         print(f"   Patients tested: {len(all_metrics)}")
         print(f"   Success rate: {successful/total_patients*100:.1f}%")
 
 def generate_visualization_plots(all_metrics, metric_stats, output_base_dir):
     """生成可视化图表"""
-    if not all_metrics:
+    if not all_metrics or not metric_stats:
         return
     
     viz_dir = os.path.join(output_base_dir, "visualizations")
     os.makedirs(viz_dir, exist_ok=True)
     
-    # 设置中文字体支持
+    # 设置matplotlib参数
     plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
     
@@ -449,33 +525,36 @@ def generate_visualization_plots(all_metrics, metric_stats, output_base_dir):
         plt.close()
     
     # 3. 指标相关性热图
-    import pandas as pd
-    
-    df_metrics = pd.DataFrame(all_metrics)
-    numeric_cols = ['dice', 'iou', 'accuracy', 'precision', 'recall', 'f1_score', 'specificity']
-    numeric_cols = [col for col in numeric_cols if col in df_metrics.columns]
-    
-    if len(numeric_cols) > 1:
-        correlation_matrix = df_metrics[numeric_cols].corr()
+    try:
+        import pandas as pd
         
-        plt.figure(figsize=(10, 8))
-        im = plt.imshow(correlation_matrix, cmap='coolwarm', aspect='auto', vmin=-1, vmax=1)
-        plt.colorbar(im)
+        df_metrics = pd.DataFrame(all_metrics)
+        numeric_cols = ['dice', 'iou', 'accuracy', 'precision', 'recall', 'f1_score', 'specificity']
+        numeric_cols = [col for col in numeric_cols if col in df_metrics.columns]
         
-        # 添加标签
-        plt.xticks(range(len(numeric_cols)), [col.upper() for col in numeric_cols], rotation=45)
-        plt.yticks(range(len(numeric_cols)), [col.upper() for col in numeric_cols])
-        
-        # 添加数值
-        for i in range(len(numeric_cols)):
-            for j in range(len(numeric_cols)):
-                plt.text(j, i, f'{correlation_matrix.iloc[i, j]:.2f}', 
-                        ha='center', va='center', color='black' if abs(correlation_matrix.iloc[i, j]) < 0.5 else 'white')
-        
-        plt.title('Metrics Correlation Heatmap')
-        plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, 'correlation_heatmap.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+        if len(numeric_cols) > 1:
+            correlation_matrix = df_metrics[numeric_cols].corr()
+            
+            plt.figure(figsize=(10, 8))
+            im = plt.imshow(correlation_matrix, cmap='coolwarm', aspect='auto', vmin=-1, vmax=1)
+            plt.colorbar(im)
+            
+            # 添加标签
+            plt.xticks(range(len(numeric_cols)), [col.upper() for col in numeric_cols], rotation=45)
+            plt.yticks(range(len(numeric_cols)), [col.upper() for col in numeric_cols])
+            
+            # 添加数值
+            for i in range(len(numeric_cols)):
+                for j in range(len(numeric_cols)):
+                    plt.text(j, i, f'{correlation_matrix.iloc[i, j]:.2f}', 
+                            ha='center', va='center', color='black' if abs(correlation_matrix.iloc[i, j]) < 0.5 else 'white')
+            
+            plt.title('Metrics Correlation Heatmap')
+            plt.tight_layout()
+            plt.savefig(os.path.join(viz_dir, 'correlation_heatmap.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+    except ImportError:
+        print("Warning: pandas not available, skipping correlation heatmap")
 
 def generate_summary_report(results, output_base_dir):
     """生成简单总结报告（保持向后兼容）"""
@@ -497,7 +576,7 @@ def generate_summary_report(results, output_base_dir):
     print(f"Average time per patient: {total_time/total_patients:.2f} seconds")
     
     # 写入文件
-    with open(summary_file, 'w') as f:
+    with open(summary_file, 'w', encoding='utf-8') as f:
         f.write(f"BRAIN TUMOR SEGMENTATION - BATCH TEST SUMMARY\n")
         f.write(f"{'='*60}\n")
         f.write(f"Test completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -513,7 +592,7 @@ def generate_summary_report(results, output_base_dir):
         f.write(f"DETAILED RESULTS:\n")
         f.write(f"{'-'*60}\n")
         for result in results:
-            status = "✅ SUCCESS" if result['success'] else "❌ FAILED"
+            status = "SUCCESS" if result['success'] else "FAILED"
             f.write(f"Patient {result['patient_id']}: {status} ({result['duration']:.2f}s)\n")
             if not result['success']:
                 f.write(f"  Error: {result['output'][:100]}...\n")
@@ -533,21 +612,28 @@ def main():
                        help='Path to dataset directory (default: dataset_segmentation)')
     parser.add_argument('--model_path', default='best_brain_tumor_model.pth',
                        help='Path to trained model (default: best_brain_tumor_model.pth)')
-    parser.add_argument('--output_dir', default='batch_test_results',
-                       help='Output directory for all results (default: batch_test_results)')
+    parser.add_argument('--output_dir', default=None,
+                       help='Output directory for all results (default: summary_YYYYMMDD_HHMMSS)')
     parser.add_argument('--compare_script', default='compare.py',
                        help='Path to compare script (default: compare.py)')
     parser.add_argument('--patients', nargs='*', default=None,
                        help='Specific patient IDs to test (default: all patients)')
     parser.add_argument('--skip_existing', action='store_true',
                        help='Skip patients that already have results')
+    parser.add_argument('--skip_model_check', action='store_true',
+                       help='Skip model compatibility check')
     
     args = parser.parse_args()
+    
+    # 生成带时间戳的输出目录名称
+    if args.output_dir is None:
+        output_base_dir = os.path.abspath(generate_timestamp_folder_name("summary"))
+    else:
+        output_base_dir = os.path.abspath(args.output_dir)
     
     # 转换为绝对路径
     dataset_dir = os.path.abspath(args.dataset_dir)
     model_path = os.path.abspath(args.model_path)
-    output_base_dir = os.path.abspath(args.output_dir)
     compare_script_path = os.path.abspath(args.compare_script)
     
     print(f"Dataset directory: {dataset_dir}")
@@ -568,8 +654,22 @@ def main():
         print(f"Error: Compare script not found: {compare_script_path}")
         return
     
+    # 检查模型兼容性
+    model_info = None
+    if not args.skip_model_check:
+        model_compatible, model_format = check_model_compatibility(model_path)
+        model_info = (model_compatible, model_format)
+        
+        if not model_compatible:
+            print(f"Model compatibility check failed: {model_format}")
+            print("You can continue with --skip_model_check, but tests may fail")
+            choice = input("Continue anyway? (y/N): ").lower()
+            if choice != 'y':
+                return
+    
     # 创建输出目录
     os.makedirs(output_base_dir, exist_ok=True)
+    print(f"Created output directory: {output_base_dir}")
     
     # 找到所有patients
     all_patients = find_all_patients(dataset_dir)
@@ -607,7 +707,8 @@ def main():
         print(f"\nProgress: {i+1}/{len(all_patients)}")
         
         success, duration, output = run_single_test(
-            patient_info, model_path, output_base_dir, compare_script_path
+            patient_info, model_path, output_base_dir, compare_script_path,
+            model_format=model_info[1] if model_info else None
         )
         
         results.append({
@@ -630,7 +731,7 @@ def main():
     generate_summary_report(results, output_base_dir)
     
     # 生成全面报告
-    generate_comprehensive_report(results, all_metrics, output_base_dir)
+    generate_comprehensive_report(results, all_metrics, output_base_dir, model_info)
     
     print(f"\nBatch testing completed!")
     print(f"Results saved in: {output_base_dir}")
@@ -645,8 +746,14 @@ if __name__ == "__main__":
         print("python run_all_tests.py")
         print("python run_all_tests.py --patients 001 002 003")
         print("python run_all_tests.py --skip_existing")
-        print("python run_all_tests.py --output_dir my_batch_results")
+        print("python run_all_tests.py --output_dir my_custom_results")
+        print("python run_all_tests.py --skip_model_check")
+        print("\nDefault output folder naming:")
+        example_name = generate_timestamp_folder_name("summary")
+        print(f"- Without --output_dir: {example_name}")
+        print("- With --output_dir: uses your specified name")
         print("\nThis script will:")
+        print("- Check model compatibility with new training formats")
         print("- Find all patients in the dataset")
         print("- Run compare.py for each patient")
         print("- Generate individual result folders")

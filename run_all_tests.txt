@@ -1,0 +1,1 @@
+python BrainTumorSegmentation\run_all_tests.py --dataset_dir dataset_segmentation\
