@@ -445,8 +445,8 @@ def process_single_patient(input_path, model, device, output_dir):
     print(f"  Largest component: {stats['largest_component_size']:,} voxels")
     print(f"  Bounding box size: {stats['bbox_size']}")
     
-    # 保存NIfTI分割结果
-    segmentation_output_path = os.path.join(patient_output_dir, f"{patient_id}_predicted_segmentation.nii.gz")
+    # 保存NIfTI分割结果 - 修改文件名格式
+    segmentation_output_path = os.path.join(patient_output_dir, f"{patient_id}_seg.nii.gz")
     save_nifti_segmentation(processed_mask, nifti_img, segmentation_output_path)
     
     # 创建3D网格
